@@ -78,6 +78,7 @@ discretion.**
 
 * Survey the Clojure testing facilities and decide on one.
 * Seriously! MOAR TESTS!
+* Proper validation for IDs and messages.
 * DTLS.
 * Implement indirection.
 * Implement lease functionality.
