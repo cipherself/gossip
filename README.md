@@ -4,7 +4,7 @@
 of messages in a decentralized manner over unreliable networks.
 
 It is based on the paper [Peer-to-Peer Membership Management
-for Gossip-Based Protocols](http://pages.saclay.inria.fr/laurent.massoulie/ieee_tocs.pdf) 
+for Gossip-Based Protocols](https://web.archive.org/web/20240816035237/https://people.maths.bris.ac.uk/~maajg/ieeetocs03-scamp.pdf) 
 
 [![Clojars Project](https://clojars.org/gossip/latest-version.svg)](https://clojars.org/gossip)
 
