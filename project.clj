@@ -1,6 +1,6 @@
 (defproject gossip "0.1.0"
   :description "gossip is a library to do gossip dissemination of messages in a decentralized manner over unreliable networks."
-  :url "https://github.com/skeuomorf/gossip"
+  :url "https://github.com/cipherself/gossip"
   :license {:name "MIT public license"
             :url "http://opensource.org/licenses/MIT"}
   :dependencies [[org.clojure/clojure "1.7.0"]
