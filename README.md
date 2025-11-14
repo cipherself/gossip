@@ -8,7 +8,7 @@ for Gossip-Based Protocols](https://web.archive.org/web/20240816035237/https://p
 
 [![Clojars Project](https://clojars.org/gossip/latest-version.svg)](https://clojars.org/gossip)
 
-[Latest codox API docs](https://skeuomorf.github.io/gossip/)
+[Latest codox API docs](https://cipherself.github.io/gossip/)
 
 **WARNING WARNING WARNING: The messages gossiped between nodes
 are not encrypted, they are sent as plaintext, use at your own
