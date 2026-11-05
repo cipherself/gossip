@@ -1,5 +1,5 @@
 (ns gossip.core
-  (:require [clojure.string :refer [split]]
+  (:require [gossip.wire :as wire]
             [udp-wrapper.core :refer [send-message packet make-address get-ip
                                       get-port get-data get-bytes-utf8]]
             [overtone.at-at :refer [mk-pool every]]))
@@ -19,6 +19,8 @@
                    heartbeat-counter 5
                    forward-counters {}
                    received-messages #{}}}]
+  (wire/node-id ip port)
+  (doseq [id (concat in-view partial-view)] (wire/require-id id))
   {:ip ip
    :port port
    :in-view in-view
@@ -31,7 +33,7 @@
   "Get the id of a node map e.g. {:ip \"192.168.1.1\" :port 1024} 
   as a string \"ip:port\"."
   [node]
-  (str (:ip node) ":" (:port node)))
+  (wire/node-id (:ip node) (:port node)))
 
 (defn post-send-initial
   "Add contact-id to subscriber's partial-view."
@@ -45,21 +47,14 @@
 (defn send-initial
   "Send an initial subscription message to a contact node."
   [socket subscriber-ref contact-id]
-  (let [contact-info (split contact-id #":")]
-    (send-message socket (packet
-                          (get-bytes-utf8 "initial")
-                          (make-address (first contact-info))
-                          (Integer/parseInt (last contact-info))))
-    (post-send-initial subscriber-ref contact-id)))
+  (wire/send! socket contact-id "initial")
+  (post-send-initial subscriber-ref contact-id))
 
 (defn forward
   "Send a ForwardSubscription message containing the subscriber-id to a node."
   [socket subscriber-id node-id]
-  (let [node-info (split node-id #":")]
-    (send-message socket (packet
-                          (get-bytes-utf8 (str "forward" "--" subscriber-id))
-                          (make-address (first node-info))
-                          (Integer/parseInt (last node-info))))))
+  (wire/require-id subscriber-id)
+  (wire/send! socket node-id (str "forward--" subscriber-id)))
 
 (defn handle-receive-initial
   "Forward subscriber-id to all nodes in receiving-node's partial-view.
@@ -111,13 +106,8 @@
     (forward-prob-accept socket forwarded-to-ref subscriber-id)))
 
 (defn send-heartbeat
-  ""
   [socket node-id]
-  (let [node-info (split node-id #":")]
-    (send-message socket (packet
-                          (get-bytes-utf8 "heartbeat")
-                          (make-address (first node-info))
-                          (Integer/parseInt (last node-info))))))
+  (wire/send! socket node-id "heartbeat"))
 
 (defn schedule-heartbeat-send
   "Send a heartbeat to all nodes in the partial-view after every \"interval\"."
@@ -152,13 +142,8 @@
                                        10))))
 
 (defn send-remove
-  ""
   [socket node-id]
-  (let [node-info (split node-id #":")]
-    (send-message socket (packet
-                          (get-bytes-utf8 "remove")
-                          (make-address (first node-info))
-                          (Integer/parseInt (last node-info))))))
+  (wire/send! socket node-id "remove"))
 
 (defn handle-receive-remove
   ""
@@ -171,13 +156,9 @@
                                              (:partial-view @receiving-node-ref)))))))
 
 (defn send-replace
-  ""
   [socket node-id surrogate-id]
-  (let [node-info (split node-id #":")]
-    (send-message socket (packet
-                          (get-bytes-utf8 (str "replace" "--" surrogate-id))
-                          (make-address (first node-info))
-                          (Integer/parseInt (last node-info))))))
+  (wire/require-id surrogate-id)
+  (wire/send! socket node-id (str "replace--" surrogate-id)))
 
 (defn handle-receive-replace
   ""
@@ -213,11 +194,10 @@
 (defn gossip
   "Send a message to all nodes in the partial-view."
   [socket gossiper-ref message]
-  (doseq [x (:partial-view @gossiper-ref)]
-    (send-message socket (packet
-                          (get-bytes-utf8 (str "gossip" "--" message))
-                          (make-address (first (split x #":")))
-                          (Integer/parseInt (last (split x #":")))))))
+  (when-not (string? message)
+    (throw (ex-info "Gossip payload must be a string" {})))
+  (doseq [id (:partial-view @gossiper-ref)]
+    (wire/send! socket id (str "gossip--" message))))
 
 (defn handle-receive-gossip
   "If the node has received the message before, don't do anything.
@@ -234,24 +214,19 @@
 (defn handle-message
   "Handle received messages."
   [socket receiving-node-ref pkt]
-  (let [data (split (get-data pkt) #"--")
-        ip (get-ip pkt)
-        port (get-port pkt)]
-    (case (first data)
-      "initial" (handle-receive-initial
-                 socket
-                 receiving-node-ref
-                 (get-id {:ip ip :port port}))
-      "forward" (handle-receive-forward
-                 socket
-                 receiving-node-ref
-                 (last data))
-      "heartbeat" (handle-receive-heartbeat receiving-node-ref)
-      "remove" (handle-receive-remove
-                receiving-node-ref
-                (get-id {:ip ip :port port}))
-      "replace" (handle-receive-replace
-                 receiving-node-ref
-                 (get-id {:ip ip :port port})
-                 (last data))
-      "gossip" (handle-receive-gossip socket receiving-node-ref (last data)))))
+  (when-let [[command payload :as fields] (wire/decode pkt)]
+    (let [sender (get-id {:ip (get-ip pkt) :port (get-port pkt)})]
+      (case command
+        "initial" (when (= 1 (count fields))
+                    (handle-receive-initial socket receiving-node-ref sender))
+        "forward" (when (wire/parse-id payload)
+                    (handle-receive-forward socket receiving-node-ref payload))
+        "heartbeat" (when (= 1 (count fields))
+                      (handle-receive-heartbeat receiving-node-ref))
+        "remove" (when (= 1 (count fields))
+                   (handle-receive-remove receiving-node-ref sender))
+        "replace" (when (wire/parse-id payload)
+                    (handle-receive-replace receiving-node-ref sender payload))
+        "gossip" (when (some? payload)
+                   (handle-receive-gossip socket receiving-node-ref payload))
+        nil))))

@@ -51,8 +51,8 @@ discretion.**
 ;; Start a receiving loop for each node, handle-message
 ;; does pattern matching on the received messages and
 ;; dispatches accordingly.
-(def fut1 (receive socket1 (empty-packet 512) node1 handle-message))
-(def fut2 (receive socket2 (empty-packet 512) node2 handle-message))
+(def fut1 (receive socket1 (empty-packet 65507) node1 handle-message))
+(def fut2 (receive socket2 (empty-packet 65507) node2 handle-message))
 
 ;; Send a heartbeat every 30 seconds to all nodes in
 ;; each node's partial-view
@@ -79,9 +79,13 @@ discretion.**
 
 ## TODO
 
-* Survey the Clojure testing facilities and decide on one.
+* Tests use `clojure.test`.
 * Seriously! MOAR TESTS!
-* Proper validation for IDs and messages.
+* IDs and protocol messages are validated. Malformed datagrams are ignored.
+  Payloads preserve UTF-8 text and `--` separators, up to the UDP limit of
+  65507 bytes including the protocol prefix. The receive buffer must fit the
+  largest supported packet. Receiver errors are reported via an optional
+  `{:on-error (fn [error] ...)}` argument to `receive`.
 * DTLS.
 * Implement indirection.
 * Implement lease functionality.

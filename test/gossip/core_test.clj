@@ -74,3 +74,19 @@
       (is (= [["127.0.0.1" 1003 (str "forward--" subscriber-id)]] @sent))
       (is (= [peer-id] (:partial-view @node)))
       (is (= 0 (get-in @node [:forward-counters (keyword subscriber-id)]))))))
+
+(deftest message-validation
+  (let [node (ref (create-node "127.0.0.1" 1001))
+        pkt (fn [text] (udp/packet (udp/get-bytes-utf8 text)
+                                  (udp/make-address "127.0.0.1") 1002))]
+    (doseq [message ["unknown" "forward--bad-id" "replace--127.0.0.1:99999"
+                     "initial--extra" "heartbeat--extra" "gossip"]]
+      (is (nil? (handle-message nil node (pkt message)))))
+    (is (= #{} (:received-messages @node)))
+    (doseq [message ["hello--world" "" "λ"]]
+      (handle-message nil node (pkt (str "gossip--" message))))
+    (is (= #{"hello--world" "" "λ"} (:received-messages @node)))
+    (doseq [[ip port] [["999.0.0.1" 1234] ["127.0.0.1" 0]
+                       ["127.0.0.1" 65536] ["bad host" 1234]]]
+      (is (thrown? clojure.lang.ExceptionInfo (create-node ip port))))
+    (is (= "[::1]:1234" (get-id (create-node "::1" 1234))))))
