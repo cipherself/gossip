@@ -120,7 +120,10 @@ partial view and omit the extra `c` subscription copies described for new joins.
 If the entire partial view expires, the node rejoins through a remembered
 bootstrap or former peer and establishes a new contact edge. Ordinary renewals
 retain the current view. This recovery extension handles simultaneous expiry.
-The heartbeat jobs remain necessary for isolation recovery.
+The heartbeat jobs remain necessary for isolation recovery. A heartbeat timeout
+starts a fresh subscription generation so contacts process the recovery request.
+Earlier generations remain valid until their deadlines, including in-flight
+acknowledgements for edges established under those generations.
 
 Lease messages require this protocol version on every participating node.
 Generation records remain in memory to reject delayed stale subscriptions.

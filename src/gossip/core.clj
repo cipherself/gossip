@@ -75,17 +75,19 @@
 (declare expire-subscriptions! send-subscription forward-prob-accept)
 
 (defn- own-subscription!
-  "Create a generation once per lease, reusing it for retry attempts."
-  [node-ref]
+  "Reuse a live generation for retries, or start a fresh recovery attempt."
+  [node-ref & [force?]]
   (dosync
     (let [node @node-ref
           now (now-ms)
           previous (:subscription node)]
       (when-let [duration (:lease-duration-ms node)]
-        (if (and previous (< now (:expires-at previous)))
+        (if (and (not force?) previous (< now (:expires-at previous)))
           previous
           (let [epoch (max now (inc (get previous :epoch -1)))
                 subscription {:id (get-id node) :epoch epoch :expires-at (+ now duration)}]
+            (when (and previous (< now (:expires-at previous)))
+              (alter node-ref assoc-in [:issued-subscriptions (:epoch previous)] previous))
             (alter node-ref assoc :subscription subscription
                    :renewal? (some? previous) :renewal-pending? (some? previous))
             subscription))))))
@@ -109,6 +111,8 @@
   [node-ref]
   (let [now (now-ms)]
     (dosync
+      (alter node-ref update-in [:issued-subscriptions]
+             #(into {} (filter (fn [[_ subscription]] (< now (:expires-at subscription))) %)))
       (when-let [own (:subscription @node-ref)]
         (doseq [[peer lease] (:incoming-leases @node-ref)
                 :when (not= (:id lease) (get-id @node-ref))]
@@ -375,7 +379,10 @@
                     (alter node-ref assoc :heartbeat-counter (if (pos? counter) counter 10))
                     (when (and (not (pos? counter)) (seq (:partial-view node)))
                       (rand-nth (:partial-view node)))))]
-    (when contact (send-initial socket node-ref contact))))
+    (when contact
+      ;; A contact must process isolation recovery even within the current lease.
+      (own-subscription! node-ref true)
+      (send-initial socket node-ref contact))))
 
 (defn schedule-heartbeat-dec
   "Periodically detect isolation and retry subscription through a known peer."
@@ -442,7 +449,7 @@
       (wire/send! socket peer "forget"))
     (dosync (alter node-ref assoc :partial-view [] :in-view [] :forward-counters {}
                                 :leases {} :incoming-leases {} :contacts []
-                                :subscription nil :renewal-pending? false))))
+                                :subscription nil :issued-subscriptions {} :renewal-pending? false))))
 
 (defn gossip
   "Send a message to all nodes in the partial-view."
@@ -492,7 +499,9 @@
                        (receive-lease-info socket receiving-node-ref sender subscription))
         "edge-lease" (when-let [subscription (wire/decode-subscription payload)]
                        (expire-subscriptions! receiving-node-ref)
-                       (when (and (= subscription (:subscription @receiving-node-ref))
+                       (when (and (or (= subscription (:subscription @receiving-node-ref))
+                                      (= subscription
+                                         (get-in @receiving-node-ref [:issued-subscriptions (:epoch subscription)])))
                                   (< (now-ms) (:expires-at subscription)))
                          (record-incoming! receiving-node-ref sender subscription)))
         ;; Accept notifications from the earlier lease protocol, then correct

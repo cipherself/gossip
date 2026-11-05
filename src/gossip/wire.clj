@@ -76,7 +76,8 @@
                  (re-matches #"[0-9]{1,18}" expires-at))
         (let [epoch (Long/parseLong epoch)
               expires-at (Long/parseLong expires-at)]
-          (when (< epoch expires-at)
+          ;; The monotonic generation counter is independent of wall-clock expiry.
+          (when (pos? expires-at)
             {:id id :epoch epoch :expires-at expires-at}))))))
 
 (defn decode-walk [payload]

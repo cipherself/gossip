@@ -180,3 +180,85 @@
                          (network/drain net)
                          (expire-all)
                          (membership-consistent? nodes))))))))))))
+
+(defspec heartbeat-recovery-reprocesses-a-previously-acknowledged-join
+  {:num-tests 100 :seed 2026110506}
+  (prop/for-all [duration (gen/choose 1000 10000)
+                 indirection? gen/boolean
+                 seed (gen/choose 1 100000)]
+    (network/with-seed seed
+      (fn []
+        (let [clock (atom 100000)
+              a (ref (gossip/create-node "127.0.0.1" 3001 :c 0
+                                       :lease-duration-ms duration :indirection? indirection?))
+              b (ref (gossip/create-node "127.0.0.1" 3002 :c 0
+                                       :lease-duration-ms duration :indirection? indirection?
+                                       :partial-view ["127.0.0.1:3003"] :in-view ["127.0.0.1:3003"]))
+              c (ref (gossip/create-node "127.0.0.1" 3003 :c 0
+                                       :lease-duration-ms duration :indirection? indirection?
+                                       :partial-view ["127.0.0.1:3002"] :in-view ["127.0.0.1:3002"]))
+              nodes [a b c]
+              net (network/network nodes)]
+          (with-redefs [gossip/now-ms #(deref clock)
+                        udp/send-message #(network/send-packet net %1 %2)]
+            ;; Lose dissemination while still delivering the contact's acknowledgement.
+            (reset! (:drop? net) #(.startsWith (:text %) "subscription--"))
+            (gossip/send-initial (gossip/get-id @a) a (gossip/get-id @b))
+            (network/drain net)
+            (let [previous (:subscription @a)
+                  isolated? (empty? (:in-view @a))]
+              (reset! (:drop? net) (constantly false))
+              (dotimes [_ 10]
+                (swap! clock inc)
+                (doseq [node nodes peer (:partial-view @node)]
+                  (gossip/send-heartbeat (gossip/get-id @node) peer))
+                (network/drain net)
+                (doseq [node nodes] (gossip/heartbeat-tick (gossip/get-id @node) node))
+                (network/drain net))
+              (gossip/gossip (gossip/get-id @b) b "heartbeat-recovery")
+              (network/drain net)
+              (and isolated?
+                   (> (:epoch (:subscription @a)) (:epoch previous))
+                   (seq (:in-view @a))
+                   (contains? (:received-messages @a) "heartbeat-recovery")))))))))
+
+(deftest recovery-keeps-live-older-generation-acknowledgements
+  (let [a (ref (gossip/create-node "127.0.0.1" 3101 :c 0 :lease-duration-ms 1000))
+        b (ref (gossip/create-node "127.0.0.1" 3102 :c 0 :lease-duration-ms 1000))
+        clock (atom 100000)
+        net (network/network [a b])]
+    (with-redefs [gossip/now-ms #(deref clock)
+                  udp/send-message #(network/send-packet net %1 %2)]
+      (gossip/send-initial (gossip/get-id @a) a (gossip/get-id @b))
+      (network/drain net)
+      (let [previous (:subscription @a)
+            acknowledgement (str "edge-lease--" (gossip.wire/encode-subscription previous))]
+        (dosync (alter a assoc :heartbeat-counter 1 :in-view [] :incoming-leases {}))
+        (gossip/heartbeat-tick (gossip/get-id @a) a)
+        (network/drain net)
+        (is (> (:epoch (:subscription @a)) (:epoch previous)))
+        (gossip/handle-message (gossip/get-id @a) a
+          (udp/packet (udp/get-bytes-utf8 acknowledgement)
+                      (udp/make-address "127.0.0.1") 3102))
+        (is (= previous (get-in @a [:incoming-leases (gossip/get-id @b)])))
+        (reset! clock (:expires-at previous))
+        (gossip/expire-subscriptions! a)
+        (is (empty? (:incoming-leases @a)))
+        (is (empty? (:issued-subscriptions @a)))
+        (gossip/handle-message (gossip/get-id @a) a
+          (udp/packet (udp/get-bytes-utf8 acknowledgement)
+                      (udp/make-address "127.0.0.1") 3102))
+        (is (empty? (:incoming-leases @a)))))))
+
+(deftest recovery-generations-remain-valid-with-a-one-millisecond-lease
+  (let [node (ref (gossip/create-node "127.0.0.1" 3201 :lease-duration-ms 1
+                                     :partial-view ["127.0.0.1:3202"]))
+        sent (atom [])]
+    (with-redefs [gossip/now-ms (constantly 100000)
+                  udp/send-message (fn [_ packet] (swap! sent conj (udp/get-data packet)))]
+      (dotimes [_ 3]
+        (dosync (alter node assoc :heartbeat-counter 1))
+        (gossip/heartbeat-tick nil node))
+      (is (= [100000 100001 100002]
+             (mapv #(-> % (clojure.string/split #"--" 2) second
+                         gossip.wire/decode-subscription :epoch) @sent))))))
