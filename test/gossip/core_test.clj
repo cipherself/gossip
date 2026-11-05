@@ -14,7 +14,8 @@
                   :forward-counters {}
                   :received-messages #{}
                   :c 10
-                  :lease-duration-ms nil}]
+                  :lease-duration-ms nil
+                  :indirection? false}]
     (is (= node node-map))))
 
 (deftest node-id
@@ -175,6 +176,7 @@
                             :partial-view [(get-id @b)]))
         net (network/network [a b c])]
     (with-redefs [now-ms #(deref clock)
+                  clojure.core/rand-nth first
                   clojure.core/rand (constantly 0.0)
                   udp/send-message #(network/send-packet net %1 %2)]
       ;; Initial joins carry a generation and deadline through all forwarded copies.
@@ -185,7 +187,8 @@
         (swap! clock + 1000)
         (expire-subscriptions! b)
         (is (not-any? #{(get-id @a)} (:partial-view @b)))
-        ;; Keep a reachable bootstrap view, then lose the first renewal request.
+        ;; Keep a live contact lease to exercise ordinary renewal, then lose it.
+        (dosync (alter a assoc-in [:leases (get-id @c) :expires-at] (+ @clock 1000)))
         (reset! (:drop? net) #(= "renew" (first (clojure.string/split (:text %) #"--" 2))))
         (lease-tick (get-id @a) a)
         (is (:renewal-pending? @a))
@@ -216,3 +219,133 @@
   (doseq [duration [0 -1 1.5 86400001]]
     (is (thrown? clojure.lang.ExceptionInfo
                  (create-node "127.0.0.1" 1601 :lease-duration-ms duration)))))
+
+(deftest indirection-selects-contact-beyond-bootstrap
+  (doseq [lease-duration [nil 10000]]
+    (let [make-node (fn [port next-port previous-port]
+                      (ref (create-node "127.0.0.1" port :c 0 :indirection? true
+                                        :lease-duration-ms lease-duration
+                                        :partial-view [(str "127.0.0.1:" next-port)]
+                                        :in-view [(str "127.0.0.1:" previous-port)])))
+          a (make-node 1701 1702 1703)
+          b (make-node 1702 1703 1701)
+          c (make-node 1703 1701 1702)
+          newcomer (ref (create-node "127.0.0.1" 1704 :c 0 :indirection? true
+                                    :lease-duration-ms lease-duration))
+          net (network/network [a b c newcomer])]
+      (with-redefs [clojure.core/rand (constantly 0.0)
+                    udp/send-message #(network/send-packet net %1 %2)]
+        (doseq [node [a b c]] (refresh-weights (get-id @node) node))
+        (network/drain net)
+        (send-initial (get-id @newcomer) newcomer (get-id @a))
+        (network/drain net)
+        (is (= [(get-id @c)] (:partial-view @newcomer)))
+        (is (some #{(get-id @newcomer)} (:in-view @c)))
+        (is (not-any? #{(get-id @newcomer)} (:in-view @a)))
+        (is (= 2 (count (filter #(.startsWith (:text %) "walk--") @(:sent net)))))
+        ;; Every resulting directed edge has its reciprocal incoming record.
+        (doseq [node [a b c newcomer]
+                peer (:partial-view @node)]
+          (is (some #{(get-id @node)} (:in-view @((:nodes net) peer)))))))))
+
+(deftest weighted-selection-and-refresh
+  (is (= "b" (gossip.weights/choose-peer ["a" "b"] {"a" 0.0 "b" 1.0} 0.0)))
+  (is (= "a" (gossip.weights/choose-peer ["a" "b"] {"a" 0.75 "b" 0.25} 0.74)))
+  (is (= "b" (gossip.weights/choose-peer ["a" "b"] {"a" 0.75 "b" 0.25} 0.76)))
+  (let [node (ref (assoc (create-node "127.0.0.1" 1801
+                                     :partial-view ["127.0.0.1:1802" "127.0.0.1:1803"]
+                                     :in-view ["127.0.0.1:1804"])
+                         :out-weights {"127.0.0.1:1802" 0.25 "obsolete" 9.0}))
+        sent (atom [])]
+    (with-redefs [udp/send-message (fn [_ p] (swap! sent conj (udp/get-data p)))]
+      (refresh-weights nil node)
+      (is (= {"127.0.0.1:1802" 0.5 "127.0.0.1:1803" 0.5} (:out-weights @node)))
+      (is (= {"127.0.0.1:1804" 1.0} (:in-weights @node)))
+      (is (= 3 (count @sent))))))
+
+(deftest malformed-extension-messages-do-not-change-membership
+  (let [node (ref (create-node "127.0.0.1" 1901))]
+    (doseq [text ["join--bad" "subscription--127.0.0.1:1902|bad|3"
+                  "walk--127.0.0.1:1902|0|0|127.0.0.1:1903|99999|join"
+                  "weight--out|NaN" "weight--out|-0.1" "weight--out|Infinity"
+                  "weight--in|0.5|extra" "contact--bad"]]
+      (handle-message nil node
+        (udp/packet (udp/get-bytes-utf8 text) (udp/make-address "127.0.0.1") 1902)))
+    (is (empty? (:partial-view @node)))
+    (is (empty? (:in-view @node)))
+    (is (nil? (:in-weights @node)))))
+
+(deftest indirection-stops-at-empty-bootstrap
+  (let [a (ref (create-node "127.0.0.1" 1951 :indirection? true))
+        b (ref (create-node "127.0.0.1" 1952 :indirection? true))
+        net (network/network [a b])]
+    (with-redefs [udp/send-message #(network/send-packet net %1 %2)]
+      (send-initial (get-id @a) a (get-id @b))
+      (network/drain net)
+      (is (= [(get-id @b)] (:partial-view @a)))
+      (is (= [(get-id @a)] (:in-view @b))))))
+
+(deftest group-recovers-after-simultaneous-lease-expiry
+  (doseq [indirection? [false true]]
+    (let [clock (atom 1000000)
+          nodes (mapv #(ref (create-node "127.0.0.1" % :c 0
+                                         :lease-duration-ms 1000 :indirection? indirection?))
+                      [2001 2002 2003])
+          [a b c] nodes
+          net (network/network nodes)]
+      (with-redefs [now-ms #(deref clock)
+                    clojure.core/rand (constantly 0.0)
+                    clojure.core/rand-nth first
+                    udp/send-message #(network/send-packet net %1 %2)]
+        (send-initial (get-id @b) b (get-id @a))
+        (network/drain net)
+        (send-initial (get-id @c) c (get-id @b))
+        (network/drain net)
+        (dotimes [generation 3]
+          (swap! clock + 1000)
+          (doseq [node nodes] (expire-subscriptions! node))
+          (doseq [node nodes] (lease-tick (get-id @node) node))
+          (network/drain net)
+          (doseq [node nodes]
+            (is (seq (:partial-view @node)))
+            (is (false? (:renewal-pending? @node))))
+          (let [message (str "generation-" generation)]
+            (gossip (get-id @a) a message)
+            (network/drain net)
+            (is (every? #(contains? (:received-messages @%) message) nodes))))))))
+
+(deftest replacement-rejects-self-duplicate-and-replayed-edges
+  (let [node (ref (create-node "127.0.0.1" 2101
+                               :partial-view ["127.0.0.1:2102" "127.0.0.1:2103"]))]
+    (handle-receive-replace node "127.0.0.1:2102" "127.0.0.1:2103")
+    (is (= ["127.0.0.1:2103"] (:partial-view @node)))
+    (handle-receive-replace node "127.0.0.1:2102" "127.0.0.1:2104")
+    (is (= ["127.0.0.1:2103"] (:partial-view @node)))
+    (handle-receive-replace node "127.0.0.1:2103" (get-id @node))
+    (is (empty? (:partial-view @node)))))
+
+(deftest weights-ignore-removed-edges
+  (let [node (ref (create-node "127.0.0.1" 2201
+                               :partial-view ["127.0.0.1:2202"]
+                               :in-view ["127.0.0.1:2203"]))
+        deliver (fn [port payload]
+                  (handle-message nil node
+                    (udp/packet (udp/get-bytes-utf8 payload)
+                                (udp/make-address "127.0.0.1") port)))]
+    (deliver 2202 "weight--in|0.25")
+    (deliver 2203 "weight--out|0.75")
+    (is (= {"127.0.0.1:2202" 0.25} (:out-weights @node)))
+    (is (= {"127.0.0.1:2203" 0.75} (:in-weights @node)))
+    (handle-receive-remove node "127.0.0.1:2202")
+    (deliver 2202 "weight--in|0.5")
+    (is (empty? (:partial-view @node)))
+    (is (= 0.25 (get-in @node [:out-weights "127.0.0.1:2202"])))
+    (deliver 2204 "weight--out|0.5")
+    (is (nil? (get-in @node [:in-weights "127.0.0.1:2204"])))))
+
+(deftest initial-views-have-no-self-or-duplicate-edges
+  (let [node (create-node "127.0.0.1" 2301
+                           :in-view ["127.0.0.1:2301" "127.0.0.1:2302" "127.0.0.1:2302"]
+                           :partial-view ["127.0.0.1:2301" "127.0.0.1:2302" "127.0.0.1:2302"])]
+    (is (= ["127.0.0.1:2302"] (:in-view node)))
+    (is (= ["127.0.0.1:2302"] (:partial-view node)))))

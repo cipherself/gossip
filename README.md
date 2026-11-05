@@ -56,13 +56,13 @@ discretion.**
 
 ;; Send a heartbeat every 30 seconds to all nodes in
 ;; each node's partial-view
-(schedule-heartbeat-send socket1 node1 (* 1000 60 5))
-(schedule-heartbeat-send socket2 node2 (* 1000 60 5))
+(def heartbeat-send1 (schedule-heartbeat-send socket1 node1 30000))
+(def heartbeat-send2 (schedule-heartbeat-send socket2 node2 30000))
 
 ;; Decrease the heartbeat-counter of each node
 ;; every 5 minutes.
-(schedule-heartbeat-dec socket1 node1 (* 1000 60 5))
-(schedule-heartbeat-dec socket2 node2 (* 1000 60 5))
+(def heartbeat-dec1 (schedule-heartbeat-dec socket1 node1 (* 1000 60 5)))
+(def heartbeat-dec2 (schedule-heartbeat-dec socket2 node2 (* 1000 60 5)))
 
 ;; Send an InitialSubscription from node1 to node2.
 (send-initial socket1 node1 (get-id @node2))
@@ -71,28 +71,35 @@ discretion.**
 (gossip socket1 node1 "No one shall expel us from the paradise that Cantor has created.")
 
 ;; Shutdown
+(doseq [job [heartbeat-send1 heartbeat-send2 heartbeat-dec1 heartbeat-dec2]]
+  (overtone.at-at/stop job))
 (future-cancel fut1)
 (future-cancel fut2)
 (close-udp-server socket1)
 (close-udp-server socket2)
 ```
 
+## Configuration and testing
+
+Tests use `clojure.test`. Run `lein test` to execute the unit, simulated-network,
+and loopback UDP integration tests. The simulations cover joins, departures,
+duplicate subscriptions, isolation recovery, dropped requests, leases, and
+indirection.
+
+IDs accept IPv4, bracketed IPv6, and hostnames with ports from 1 through 65535.
+Malformed datagrams are ignored. Payloads preserve UTF-8 text and `--`
+separators, up to 65507 bytes including the protocol prefix. The receive buffer
+must fit the largest supported packet. Receiver errors are reported via an
+optional `{:on-error (fn [error] ...)}` argument to `receive`.
+
+Configure subscription redundancy with `:c` in `create-node` (default 10,
+range 0..1000). Use the same value throughout a group. It controls extra
+subscription copies and the `c + 1` incoming edges removed during departure.
+Stop scheduled maintenance before calling `unsubscribe` and closing the socket.
+
 ## TODO
 
-* Tests use `clojure.test`.
-* Membership regression tests cover joins, departures, duplicate subscriptions,
-  isolation recovery, and dropped subscription requests.
-* IDs and protocol messages are validated. Malformed datagrams are ignored.
-  Payloads preserve UTF-8 text and `--` separators, up to the UDP limit of
-  65507 bytes including the protocol prefix. The receive buffer must fit the
-  largest supported packet. Receiver errors are reported via an optional
-  `{:on-error (fn [error] ...)}` argument to `receive`.
-* DTLS.
-* Implement indirection.
-* Optional subscription leases are implemented. See below.
-* Configure the subscription redundancy with `:c` in `create-node` (default 10).
-  Use the same value throughout a group. It controls extra subscription copies
-  and the `c + 1` incoming edges removed during departure.
+* DTLS and peer authentication, once deployment requirements are defined.
 
 ## Subscription leases
 
@@ -106,12 +113,34 @@ returned job handle and stop it with `overtone.at-at/stop` during shutdown.
 Maintenance expires dead peers and renews through a known peer. Lost renewal
 requests are retried until acknowledged. Renewals retain the subscriber's
 partial view and omit the extra `c` subscription copies described for new joins.
-Bootstrap contacts are retained for retrying after local lease expiry.
+If the entire partial view expires, the node rejoins through a remembered
+bootstrap or former peer and establishes a new contact edge. Ordinary renewals
+retain the current view. This recovery extension handles simultaneous expiry.
 The heartbeat jobs remain necessary for isolation recovery.
 
 Lease messages require this protocol version on every participating node.
 Generation records remain in memory to reject delayed stale subscriptions.
 They currently persist for the lifetime of the node.
+
+## Subscription indirection
+
+Enable `:indirection? true` on every node to distribute joins arriving through
+shared bootstrap nodes. A weighted walk starts with twice the bootstrap node's
+partial-view size and chooses the final contact. The subscriber receives the
+chosen contact and updates its outgoing contact edge. Walks stop early at nodes
+with no outgoing peers. If a walk ends on its subscriber, it takes one additional
+hop to avoid choosing the subscriber as its own contact.
+
+Run `(schedule-weight-refresh socket node 1000)` on each node and stop its
+returned job during shutdown. Incoming and outgoing arc weights are normalized
+separately and exchanged with their peers, as in the paper's asynchronous
+weight-update algorithm. New edges start with the mean weight of existing edges.
+The initial walk is capped at 20000 hops. No node needs a global member list.
+
+Indirection is disabled by default. It works with or without leases, and requires
+this protocol version on all participating nodes. These tests verify routing and
+membership behavior. Large-network mixing and view-size scaling have yet to be
+benchmarked.
 
 ## License
 [MIT](./LICENSE)

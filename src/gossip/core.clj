@@ -1,7 +1,7 @@
 (ns gossip.core
   (:require [gossip.wire :as wire]
-            [udp-wrapper.core :refer [send-message packet make-address get-ip
-                                      get-port get-data get-bytes-utf8]]
+            [gossip.weights :as weights]
+            [udp-wrapper.core :refer [get-ip get-port]]
             [overtone.at-at :refer [mk-pool every]]))
 
 (def my-pool (mk-pool))
@@ -17,29 +17,34 @@
                      forward-counters
                      received-messages
                      c
-                     lease-duration-ms]
+                     lease-duration-ms
+                     indirection?]
               :or {in-view []
                    partial-view []
                    heartbeat-counter 5
                    forward-counters {}
                    received-messages #{}
-                   c gossip.core/c}}]
+                   c gossip.core/c
+                   indirection? false}}]
   (when-not (and (integer? c) (<= 0 c 1000))
     (throw (ex-info "c must be an integer between 0 and 1000" {:c c})))
-  (when (and lease-duration-ms
+  (when-not (instance? Boolean indirection?)
+    (throw (ex-info "indirection? must be a boolean" {})))
+  (when (and (some? lease-duration-ms)
              (not (and (integer? lease-duration-ms) (<= 1 lease-duration-ms 86400000))))
     (throw (ex-info "Lease duration must be 1..86400000 milliseconds" {})))
   (wire/node-id ip port)
   (doseq [id (concat in-view partial-view)] (wire/require-id id))
   {:ip ip
    :port port
-   :in-view in-view
-   :partial-view partial-view
+   :in-view (vec (distinct (remove #{(wire/node-id ip port)} in-view)))
+   :partial-view (vec (distinct (remove #{(wire/node-id ip port)} partial-view)))
    :heartbeat-counter heartbeat-counter
    :forward-counters forward-counters
    :received-messages received-messages
    :c c
-   :lease-duration-ms lease-duration-ms})
+   :lease-duration-ms lease-duration-ms
+   :indirection? indirection?})
 
 (defn get-id
   "Get the id of a node map e.g. {:ip \"192.168.1.1\" :port 1024} 
@@ -75,7 +80,8 @@
           previous
           (let [epoch (max now (inc (get previous :epoch -1)))
                 subscription {:id (get-id node) :epoch epoch :expires-at (+ now duration)}]
-            (alter node-ref assoc :subscription subscription :renewal? (some? previous))
+            (alter node-ref assoc :subscription subscription
+                   :renewal? (some? previous) :renewal-pending? (some? previous))
             subscription))))))
 
 (defn- remember-subscription! [node-ref subscription]
@@ -115,18 +121,23 @@
   "Send an initial subscription message to a contact node."
   [socket subscriber-ref contact-id]
   (wire/require-id contact-id)
-  (if-let [subscription (own-subscription! subscriber-ref)]
-    (wire/send! socket contact-id (str (if (:renewal? @subscriber-ref) "renew--" "join--")
-                                           (wire/encode-subscription subscription)))
-    (wire/send! socket contact-id "initial"))
-  (post-send-initial subscriber-ref contact-id)
-  (dosync (alter subscriber-ref update-in [:contacts]
-                 #(vec (distinct (conj (or % []) contact-id)))))
-  (when-let [duration (:lease-duration-ms @subscriber-ref)]
+  (let [subscription (own-subscription! subscriber-ref)]
+    ;; Prepare local state before sending, because a reply may arrive immediately.
+    (post-send-initial subscriber-ref contact-id)
     (dosync
-      (alter subscriber-ref assoc-in [:leases contact-id]
-             (or (get-in @subscriber-ref [:known-subscriptions contact-id])
-                 {:id contact-id :epoch 0 :expires-at (+ (now-ms) duration)})))))
+      (alter subscriber-ref update-in [:contacts]
+             #(vec (distinct (conj (or % []) contact-id))))
+      (when-let [duration (:lease-duration-ms @subscriber-ref)]
+        (let [known (get-in @subscriber-ref [:known-subscriptions contact-id])]
+          (alter subscriber-ref assoc-in [:leases contact-id]
+                 (if (and known (< (now-ms) (:expires-at known)))
+                   known
+                   {:id contact-id :epoch 0 :expires-at (+ (now-ms) duration)})))))
+    (wire/send! socket contact-id
+                (if subscription
+                  (str (if (:renewal? @subscriber-ref) "renew--" "join--")
+                       (wire/encode-subscription subscription))
+                  "initial"))))
 
 (defn forward
   "Send a ForwardSubscription message containing the subscriber-id to a node."
@@ -203,24 +214,105 @@
         (dosync
           (alter node-ref add-peer :in-view (:id subscription))
           (alter node-ref assoc-in [:incoming-leases (:id subscription)] subscription)))
-      (when renewal?
-        (wire/send! socket (:id subscription)
-                    (str "renewed--" (wire/encode-subscription subscription)))))))
+      (wire/send! socket (:id subscription)
+                  (str "renewed--" (wire/encode-subscription subscription))))))
+
+(defn refresh-weights
+  "Normalize incoming and outgoing arc weights and tell the corresponding peers."
+  [socket node-ref]
+  (let [node (dosync
+               (alter node-ref
+                      (fn [node]
+                        (assoc node
+                               :out-weights (weights/normalize
+                                              (weights/reconcile (:partial-view node) (:out-weights node)))
+                               :in-weights (weights/normalize
+                                             (weights/reconcile (:in-view node) (:in-weights node)))))))]
+    (doseq [[peer weight] (:out-weights node)]
+      (wire/send! socket peer (str "weight--out|" weight)))
+    (doseq [[peer weight] (:in-weights node)]
+      (wire/send! socket peer (str "weight--in|" weight)))))
+
+(defn schedule-weight-refresh
+  "Schedule the asynchronous arc-weight updates used by subscription indirection."
+  [socket node-ref interval]
+  (every interval #(refresh-weights socket node-ref) my-pool))
+
+(defn- receive-weight [node-ref sender direction weight]
+  (dosync
+    (let [[view key] (if (= direction "out")
+                       [:in-view :in-weights]
+                       [:partial-view :out-weights])]
+      (when (some #{sender} (view @node-ref))
+        (alter node-ref assoc-in [key sender] weight)))))
+
+(defn- handle-walk [socket node-ref walk]
+  (expire-subscriptions! node-ref)
+  (when (or (nil? (:subscription walk))
+            (remember-subscription! node-ref (:subscription walk)))
+    (let [node @node-ref
+          view (:partial-view node)
+          peer (when (and (or (pos? (:hops walk)) (= (:id walk) (get-id node))) (seq view))
+                 (weights/choose-peer view (:out-weights node) (rand)))]
+      (if peer
+        (wire/send! socket peer
+                    (str "walk--" (wire/encode-walk (update-in walk [:hops] #(max 0 (dec %))))))
+        ;; A node cannot serve as its own subscription contact.
+        (when (not= (:id walk) (get-id node))
+          (if-let [subscription (:subscription walk)]
+            (handle-join socket node-ref subscription (:renewal? walk))
+            (handle-receive-initial socket node-ref (:id walk)))
+          (when-not (:renewal? walk)
+            (wire/send! socket (:id walk) (str "contact--" (:contact walk)))))))))
+
+(defn- route-join [socket node-ref subscriber-id subscription renewal?]
+  (if (:indirection? @node-ref)
+    (handle-walk socket node-ref
+                 {:id subscriber-id :subscription subscription
+                  :contact (get-id @node-ref)
+                  :hops (min 20000 (* 2 (count (:partial-view @node-ref))))
+                  :renewal? renewal?})
+    (if subscription
+      (handle-join socket node-ref subscription renewal?)
+      (handle-receive-initial socket node-ref subscriber-id))))
+
+(defn- receive-contact [socket node-ref old-contact new-contact]
+  (when (not= new-contact (get-id @node-ref))
+    (let [changed? (dosync
+                     (when (some #{old-contact} (:partial-view @node-ref))
+                       (alter node-ref remove-peer :partial-view old-contact)
+                       (alter node-ref add-peer :partial-view new-contact)
+                       (when-let [lease (get-in @node-ref [:leases old-contact])]
+                         (alter node-ref update-in [:leases] dissoc old-contact)
+                         (alter node-ref assoc-in [:leases new-contact] (assoc lease :id new-contact)))
+                       true))]
+      (when changed?
+        (when (not= old-contact new-contact)
+          (wire/send! socket old-contact "forget"))
+        (notify-kept socket node-ref new-contact)))))
 
 (defn lease-tick
-  "Expire dead peers and renew, retrying lost renewal requests until acknowledged."
+  "Expire dead peers and renew, retrying lost requests until acknowledged.
+  A node whose entire view expires rejoins through a remembered peer."
   [socket node-ref]
   (expire-subscriptions! node-ref)
   (let [node @node-ref
         previous (:subscription node)
-        contacts (vec (distinct (concat (:partial-view node) (:contacts node))))
+        contacts (vec (distinct (concat (:partial-view node) (:contacts node)
+                                        (keys (:known-subscriptions node)))))
         due? (or (nil? previous) (<= (:expires-at previous) (now-ms)))]
     (when (and (:lease-duration-ms node) (seq contacts)
-               (or due? (:renewal-pending? node)))
-      (let [subscription (own-subscription! node-ref)]
-        (dosync (alter node-ref assoc :renewal-pending? true))
-        (wire/send! socket (rand-nth contacts)
-                    (str "renew--" (wire/encode-subscription subscription)))))))
+               (or due? (:renewal-pending? node) (empty? (:partial-view node))))
+      (let [contact (rand-nth contacts)
+            subscription (own-subscription! node-ref)]
+        (if (empty? (:partial-view @node-ref))
+          (do
+            (dosync (alter node-ref assoc :renewal? false))
+            (send-initial socket node-ref contact))
+          (do
+            (dosync (alter node-ref assoc :renewal-pending? true))
+            (wire/send! socket contact
+                        (str "renew--" (wire/encode-subscription subscription)))))))))
 
 (defn schedule-lease-maintenance
   "Run lease expiry and renewal. The interval should be shorter than the lease."
@@ -343,17 +435,21 @@
   (when-let [[command payload :as fields] (wire/decode pkt)]
     (let [sender (get-id {:ip (get-ip pkt) :port (get-port pkt)})]
       (case command
+        "walk" (when-let [walk (wire/decode-walk payload)]
+                 (handle-walk socket receiving-node-ref walk))
+        "weight" (when-let [[direction weight] (wire/decode-weight payload)]
+                   (receive-weight receiving-node-ref sender direction weight))
+        "contact" (when (wire/parse-id payload)
+                    (receive-contact socket receiving-node-ref payload sender))
         "join" (when-let [subscription (wire/decode-subscription payload)]
                  (when (= sender (:id subscription))
-                   (handle-join socket receiving-node-ref subscription false)))
+                   (route-join socket receiving-node-ref sender subscription false)))
         "renew" (when-let [subscription (wire/decode-subscription payload)]
                   (when (= sender (:id subscription))
-                    (handle-join socket receiving-node-ref subscription true)))
+                    (route-join socket receiving-node-ref sender subscription true)))
         "renewed" (when-let [subscription (wire/decode-subscription payload)]
                     (dosync
-                      (when (and (= subscription (:subscription @receiving-node-ref))
-                                 (some #{sender} (concat (:partial-view @receiving-node-ref)
-                                                        (:contacts @receiving-node-ref))))
+                      (when (= subscription (:subscription @receiving-node-ref))
                         (alter receiving-node-ref assoc :renewal-pending? false))))
         "subscription" (when-let [subscription (wire/decode-subscription payload)]
                          (handle-subscription socket receiving-node-ref subscription))
@@ -365,13 +461,15 @@
                            (alter receiving-node-ref add-peer :in-view sender)
                            (alter receiving-node-ref assoc-in [:incoming-leases sender] subscription))))
         "initial" (when (= 1 (count fields))
-                    (handle-receive-initial socket receiving-node-ref sender))
+                    (route-join socket receiving-node-ref sender nil false))
         "forward" (when (wire/parse-id payload)
                     (handle-receive-forward socket receiving-node-ref payload))
         "kept" (when (= 1 (count fields))
                  (dosync (alter receiving-node-ref add-peer :in-view sender)))
         "forget" (when (= 1 (count fields))
-                   (dosync (alter receiving-node-ref remove-peer :in-view sender)))
+                   (dosync
+                     (alter receiving-node-ref remove-peer :in-view sender)
+                     (alter receiving-node-ref update-in [:incoming-leases] dissoc sender)))
         "heartbeat" (when (= 1 (count fields))
                       (handle-receive-heartbeat receiving-node-ref))
         "remove" (when (= 1 (count fields))

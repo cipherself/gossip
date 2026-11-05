@@ -29,13 +29,16 @@
     (when-let [[_ host port] (or (re-matches #"\[([^\]]+)\]:([0-9]{1,5})" id)
                                 (re-matches #"([^:]+):([0-9]{1,5})" id))]
       (let [port (Integer/parseInt port)]
-        (when (and (valid-host? host) (valid-port? port))
+        (when (and (or (not (string/starts-with? id "[")) (string/includes? host ":"))
+                   (valid-host? host) (valid-port? port))
           [host port])))))
 
 (defn require-id [id]
   (or (parse-id id) (throw (ex-info "Invalid node ID" {:id id}))))
 
 (defn node-id [host port]
+  (when-not (and (valid-host? host) (valid-port? port))
+    (throw (ex-info "Invalid host or port" {:host host :port port})))
   (let [id (str (if (string/includes? host ":") (str "[" host "]") host) ":" port)]
     (require-id id)
     id))
@@ -75,3 +78,31 @@
               expires-at (Long/parseLong expires-at)]
           (when (< epoch expires-at)
             {:id id :epoch epoch :expires-at expires-at}))))))
+
+(defn decode-walk [payload]
+  (when (string? payload)
+    (let [[id epoch expiry contact hops mode :as fields] (string/split payload #"\|" -1)
+          subscription (decode-subscription (string/join "|" [id epoch expiry]))]
+      (when (and (= 6 (count fields)) (parse-id id) (parse-id contact)
+                 (or subscription (and (= "0" epoch) (= "0" expiry)))
+                 (re-matches #"[0-9]{1,5}" hops)
+                 (<= (Long/parseLong hops) 20000)
+                 (#{"join" "renew"} mode)
+                 (or subscription (= mode "join")))
+        {:id id :subscription subscription :contact contact
+         :hops (Long/parseLong hops) :renewal? (= mode "renew")}))))
+
+(defn encode-walk [{:keys [id subscription contact hops renewal?]}]
+  (str (if subscription (encode-subscription subscription) (str id "|0|0"))
+       "|" contact "|" hops "|" (if renewal? "renew" "join")))
+
+(defn decode-weight [payload]
+  (when (string? payload)
+    (let [[direction value :as fields] (string/split payload #"\|" -1)]
+      (when (and (= 2 (count fields)) (#{"in" "out"} direction)
+                 (<= (count value) 32))
+        (try
+          (let [weight (Double/parseDouble value)]
+            (when (and (Double/isFinite weight) (<= 0.0 weight 1.0))
+              [direction weight]))
+          (catch NumberFormatException _ nil))))))
