@@ -66,7 +66,7 @@
   (wire/require-id contact-id)
   (dosync (alter subscriber-ref add-peer :partial-view contact-id)))
 
-(declare expire-subscriptions! send-subscription)
+(declare expire-subscriptions! send-subscription forward-prob-accept)
 
 (defn- own-subscription!
   "Create a generation once per lease, reusing it for retry attempts."
@@ -175,9 +175,12 @@
   [socket receiving-node-ref subscriber-id]
   (let [f (partial forward socket subscriber-id)
         partial-view (:partial-view @receiving-node-ref)]
-    (when-not (empty? partial-view)
-      (run! f partial-view)
-      (run! f (repeatedly (get @receiving-node-ref :c c) #(rand-nth partial-view))))
+    (if (empty? partial-view)
+      ;; Seed a connected group when the first subscriber reaches an empty node.
+      (forward-prob-accept socket receiving-node-ref subscriber-id)
+      (do
+        (run! f partial-view)
+        (run! f (repeatedly (get @receiving-node-ref :c c) #(rand-nth partial-view)))))
     (dosync (alter receiving-node-ref add-peer :in-view subscriber-id))))
 
 (defn forward-prob-accept
@@ -229,9 +232,11 @@
           node @node-ref
           view (:partial-view node)
           extra (if renewal? 0 (get node :c c))]
-      (when (and first-join? (seq view))
-        (doseq [peer (concat view (repeatedly extra #(rand-nth view)))]
-          (send-subscription socket peer subscription)))
+      (when first-join?
+        (if (seq view)
+          (doseq [peer (concat view (repeatedly extra #(rand-nth view)))]
+            (send-subscription socket peer subscription))
+          (forward-prob-accept socket node-ref (:id subscription) subscription)))
       (when-not renewal?
         (let [contact-subscription (own-subscription! node-ref)]
           (record-incoming! node-ref (:id subscription) contact-subscription)

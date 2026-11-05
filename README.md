@@ -140,6 +140,9 @@ returned job during shutdown. Incoming and outgoing arc weights are normalized
 separately and exchanged with their peers, as in the paper's asynchronous
 weight-update algorithm. New edges start with the mean weight of existing edges.
 The initial walk is capped at 20000 hops. No node needs a global member list.
+An empty bootstrap keeps its first subscriber directly, establishing a path in
+both directions before it handles further joins. This initialization extension
+also applies with indirection and leases disabled.
 
 Indirection is disabled by default. It works with or without leases, and requires
 this protocol version on all participating nodes. These tests verify routing and

@@ -30,3 +30,13 @@
            (gossip/handle-message destination node
              (udp/packet (udp/get-bytes-utf8 text) (udp/make-address host) port))))
        (recur (dec remaining))))))
+
+(defn with-seed
+  "Run protocol randomness reproducibly without changing production APIs."
+  [seed f]
+  (let [random (java.util.Random. seed)]
+    (with-redefs [clojure.core/rand (fn
+                                    ([] (.nextDouble random))
+                                    ([n] (* n (.nextDouble random))))
+                  clojure.core/rand-nth #(nth % (.nextInt random (count %)))]
+      (f))))

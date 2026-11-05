@@ -76,3 +76,47 @@
       (is (= [(gossip/get-id @b)] (:partial-view @a)))
       (is (= [(gossip/get-id @a)] (:in-view @b)))
       (is (membership-consistent? [a b])))))
+
+(defspec empty-bootstrap-creates-a-connected-start
+  {:num-tests 100 :seed 2026110502}
+  (prop/for-all [size (gen/choose 2 20)
+                 parameter (gen/choose 0 2)
+                 indirection? gen/boolean
+                 leases? gen/boolean
+                 seed (gen/choose 1 100000)]
+    (network/with-seed seed
+      (fn []
+        (let [nodes (mapv #(ref (gossip/create-node "127.0.0.1" (+ 2500 %)
+                                   :c parameter :indirection? indirection?
+                                   :lease-duration-ms (when leases? 10000))) (range size))
+              bootstrap (first nodes)
+              net (network/network nodes)]
+          (with-redefs [gossip/now-ms (constantly 100000)
+                        udp/send-message #(network/send-packet net %1 %2)]
+            (gossip/send-initial (gossip/get-id @(nodes 1)) (nodes 1) (gossip/get-id @bootstrap))
+            (network/drain net)
+            (let [connected-pair? (and (= [(gossip/get-id @(nodes 1))] (:partial-view @bootstrap))
+                                       (= [(gossip/get-id @bootstrap)] (:partial-view @(nodes 1))))]
+              (doseq [node (drop 2 nodes)]
+                (gossip/send-initial (gossip/get-id @node) node (gossip/get-id @bootstrap))
+                (network/drain net))
+              (and connected-pair?
+                   (every? #(seq (:partial-view @%)) nodes)
+                   (membership-consistent? nodes)))))))))
+
+(deftest first-subscriber-can-receive-from-bootstrap
+  (doseq [indirection? [false true]
+          duration [nil 10000]]
+    (let [a (ref (gossip/create-node "127.0.0.1" 2601 :c 0
+                                   :indirection? indirection? :lease-duration-ms duration))
+          b (ref (gossip/create-node "127.0.0.1" 2602 :c 0
+                                   :indirection? indirection? :lease-duration-ms duration))
+          net (network/network [a b])]
+      (with-redefs [gossip/now-ms (constantly 100000)
+                    udp/send-message #(network/send-packet net %1 %2)]
+        (gossip/send-initial (gossip/get-id @b) b (gossip/get-id @a))
+        (network/drain net)
+        (gossip/gossip (gossip/get-id @a) a "from-bootstrap")
+        (network/drain net)
+        (is (contains? (:received-messages @b) "from-bootstrap"))
+        (is (membership-consistent? [a b]))))))
