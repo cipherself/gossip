@@ -4,7 +4,10 @@
 of messages in a decentralized manner over unreliable networks.
 
 It is based on the paper [Peer-to-Peer Membership Management
-for Gossip-Based Protocols](https://web.archive.org/web/20240816035237/https://people.maths.bris.ac.uk/~maajg/ieeetocs03-scamp.pdf) 
+for Gossip-Based Protocols](./scamp.pdf)
+by Ayalvadi J. Ganesh, Anne-Marie Kermarrec, and Laurent Massoulié.
+The included PDF is from the [author's university website](https://people.maths.bris.ac.uk/~maajg/ieeetocs03-scamp.pdf)
+and remains subject to its own copyright.
 
 [![Clojars Project](https://clojars.org/gossip/latest-version.svg)](https://clojars.org/gossip)
 
