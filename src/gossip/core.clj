@@ -55,10 +55,16 @@
 (defn- add-peer [node view peer]
   (if (or (= peer (get-id node)) (some #{peer} (view node)))
     node
-    (update-in node [view] conj peer)))
+    (let [peers (conj (vec (view node)) peer)
+          weight-key (if (= view :partial-view) :out-weights :in-weights)]
+      (assoc node view peers
+                  weight-key (weights/reconcile peers (weight-key node))))))
 
 (defn- remove-peer [node view peer]
-  (update-in node [view] #(vec (remove #{peer} %))))
+  (let [weight-key (if (= view :partial-view) :out-weights :in-weights)]
+    (-> node
+        (update-in [view] #(vec (remove #{peer} %)))
+        (update-in [weight-key] dissoc peer))))
 
 (defn post-send-initial
   "Add contact-id to subscriber's partial-view."

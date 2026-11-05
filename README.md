@@ -145,9 +145,24 @@ both directions before it handles further joins. This initialization extension
 also applies with indirection and leases disabled.
 
 Indirection is disabled by default. It works with or without leases, and requires
-this protocol version on all participating nodes. These tests verify routing and
-membership behavior. Large-network mixing and view-size scaling have yet to be
-benchmarked.
+this protocol version on all participating nodes.
+
+## Simulation
+
+Run `lein simulate` to compare random contacts, a shared bootstrap, and weighted
+indirection with a lossless packet queue. Supply options as one EDN map.
+
+```sh
+lein simulate '{:sizes [100 500] :seeds [1 2 3] :modes [:indirect] :seed-size 1}'
+lein simulate '{:sizes [100] :modes [:indirect] :weight-rounds 20}'
+lein simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true}'
+```
+
+`:seed-size` selects an empty bootstrap (1) or a directed ring.
+`:weight-rounds` controls refresh sweeps every ten joins.
+`:settle-rounds` controls additional refresh sweeps after growth.
+Output includes view sizes, connectivity, reciprocal edge metadata, and weighted
+walk diagnostics. Walks that reach an empty view count as routing failures.
 
 ## License
 [MIT](./LICENSE)

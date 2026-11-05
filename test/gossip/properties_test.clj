@@ -120,3 +120,63 @@
         (network/drain net)
         (is (contains? (:received-messages @b) "from-bootstrap"))
         (is (membership-consistent? [a b]))))))
+
+(defspec new-arc-weights-are-initialized-when-the-edge-is-created
+  {:num-tests 100 :seed 2026110503}
+  (prop/for-all [first-weight (gen/choose 1 100)
+                 second-weight (gen/choose 1 100)]
+    (let [a (ref (assoc (gossip/create-node "127.0.0.1" 2701 :indirection? true
+                                          :partial-view ["127.0.0.1:2702" "127.0.0.1:2703"])
+                        :out-weights {"127.0.0.1:2702" (/ first-weight 100.0)
+                                      "127.0.0.1:2703" (/ second-weight 100.0)}))]
+      (with-redefs [clojure.core/rand (constantly 0.0)
+                    udp/send-message (fn [& _])]
+        (gossip/handle-receive-forward nil a "127.0.0.1:2704")
+        (< (Math/abs (- (/ (+ first-weight second-weight) 200.0)
+                           (get-in @a [:out-weights "127.0.0.1:2704"]))) 1.0e-12)))))
+
+(defspec obsolete-arc-weights-do-not-survive-edge-removal
+  {:num-tests 100 :seed 2026110504}
+  (prop/for-all [weight (gen/choose 0 100)]
+    (let [a (ref (assoc (gossip/create-node "127.0.0.1" 2801
+                                          :partial-view ["127.0.0.1:2802"])
+                        :out-weights {"127.0.0.1:2802" (/ weight 100.0)}))]
+      (gossip/handle-receive-remove a "127.0.0.1:2802")
+      (not (contains? (:out-weights @a) "127.0.0.1:2802")))))
+
+(defspec lease-lifecycle-preserves-reciprocal-records-after-delivery
+  {:num-tests 100 :seed 2026110505}
+  (prop/for-all [durations (gen/vector (gen/choose 100 1000) 3 7)
+                 indirection? gen/boolean
+                 seed (gen/choose 1 100000)
+                 actions (gen/vector
+                           (gen/tuple (gen/elements [:advance :maintain :replay])
+                                      (gen/choose 0 1000)) 1 15)]
+    (network/with-seed seed
+      (fn []
+        (let [clock (atom 100000)
+              nodes (mapv (fn [index duration]
+                            (ref (gossip/create-node "127.0.0.1" (+ 2900 index) :c 0
+                                     :indirection? indirection? :lease-duration-ms duration)))
+                          (range) durations)
+              net (network/network nodes)
+              bootstrap (first nodes)
+              expire-all #(doseq [node nodes] (gossip/expire-subscriptions! node))]
+          (with-redefs [gossip/now-ms #(deref clock)
+                        udp/send-message #(network/send-packet net %1 %2)]
+            (doseq [node (rest nodes)]
+              (gossip/send-initial (gossip/get-id @node) node (gossip/get-id @bootstrap))
+              (network/drain net))
+            (let [old (:subscription @(nodes 1))]
+              (and (membership-consistent? nodes)
+                   (every? true?
+                     (for [[action elapsed] actions]
+                       (do
+                         (case action
+                           :advance (swap! clock + elapsed)
+                           :maintain (doseq [node nodes] (gossip/lease-tick (gossip/get-id @node) node))
+                           :replay (gossip/send-subscription (gossip/get-id @(nodes 1))
+                                                             (gossip/get-id @bootstrap) old))
+                         (network/drain net)
+                         (expire-all)
+                         (membership-consistent? nodes))))))))))))

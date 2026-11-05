@@ -339,7 +339,7 @@
     (handle-receive-remove node "127.0.0.1:2202")
     (deliver 2202 "weight--in|0.5")
     (is (empty? (:partial-view @node)))
-    (is (= 0.25 (get-in @node [:out-weights "127.0.0.1:2202"])))
+    (is (nil? (get-in @node [:out-weights "127.0.0.1:2202"])))
     (deliver 2204 "weight--out|0.5")
     (is (nil? (get-in @node [:in-weights "127.0.0.1:2204"])))))
 
