@@ -61,3 +61,17 @@
             text (str (.decode decoder bytes))]
         (string/split text #"--" 2)))
     (catch CharacterCodingException _ nil)))
+
+(defn encode-subscription [{:keys [id epoch expires-at]}]
+  (str id "|" epoch "|" expires-at))
+
+(defn decode-subscription [payload]
+  (when (string? payload)
+    (let [[id epoch expires-at :as fields] (string/split payload #"\|" -1)]
+      (when (and (= 3 (count fields)) (parse-id id)
+                 (re-matches #"[0-9]{1,18}" epoch)
+                 (re-matches #"[0-9]{1,18}" expires-at))
+        (let [epoch (Long/parseLong epoch)
+              expires-at (Long/parseLong expires-at)]
+          (when (< epoch expires-at)
+            {:id id :epoch epoch :expires-at expires-at}))))))

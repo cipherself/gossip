@@ -89,10 +89,29 @@ discretion.**
   `{:on-error (fn [error] ...)}` argument to `receive`.
 * DTLS.
 * Implement indirection.
-* Implement lease functionality.
+* Optional subscription leases are implemented. See below.
 * Configure the subscription redundancy with `:c` in `create-node` (default 10).
   Use the same value throughout a group. It controls extra subscription copies
   and the `c + 1` incoming edges removed during departure.
+
+## Subscription leases
+
+Set `:lease-duration-ms` on every node in a group to enable leases, for example
+`(create-node ip port :c 1 :lease-duration-ms 60000)`. The default is disabled.
+Lease-enabled nodes exchange subscription generations and absolute expiry times.
+Peers need synchronized clocks. Durations must be 1..86400000 milliseconds.
+
+Run `(schedule-lease-maintenance socket node 1000)` for each node. Keep its
+returned job handle and stop it with `overtone.at-at/stop` during shutdown.
+Maintenance expires dead peers and renews through a known peer. Lost renewal
+requests are retried until acknowledged. Renewals retain the subscriber's
+partial view and omit the extra `c` subscription copies described for new joins.
+Bootstrap contacts are retained for retrying after local lease expiry.
+The heartbeat jobs remain necessary for isolation recovery.
+
+Lease messages require this protocol version on every participating node.
+Generation records remain in memory to reject delayed stale subscriptions.
+They currently persist for the lifetime of the node.
 
 ## License
 [MIT](./LICENSE)

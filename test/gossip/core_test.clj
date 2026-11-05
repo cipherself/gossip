@@ -13,7 +13,8 @@
                   :heartbeat-counter 5
                   :forward-counters {}
                   :received-messages #{}
-                  :c 10}]
+                  :c 10
+                  :lease-duration-ms nil}]
     (is (= node node-map))))
 
 (deftest node-id
@@ -165,3 +166,53 @@
       (dotimes [_ 20] (handle-receive-forward nil node (get-id @node)))
       (is (= 10 (count @sent)))
       (is (= ["127.0.0.1:1502"] (:partial-view @node))))))
+
+(deftest lease-expiry-renewal-and-stale-delivery
+  (let [clock (atom 100000)
+        a (ref (create-node "127.0.0.1" 1601 :c 1 :lease-duration-ms 1000))
+        b (ref (create-node "127.0.0.1" 1602 :c 1 :lease-duration-ms 1000))
+        c (ref (create-node "127.0.0.1" 1603 :c 1 :lease-duration-ms 1000
+                            :partial-view [(get-id @b)]))
+        net (network/network [a b c])]
+    (with-redefs [now-ms #(deref clock)
+                  clojure.core/rand (constantly 0.0)
+                  udp/send-message #(network/send-packet net %1 %2)]
+      ;; Initial joins carry a generation and deadline through all forwarded copies.
+      (send-initial (get-id @a) a (get-id @c))
+      (network/drain net)
+      (is (some #{(get-id @a)} (:partial-view @b)))
+      (let [old-subscription (:subscription @a)]
+        (swap! clock + 1000)
+        (expire-subscriptions! b)
+        (is (not-any? #{(get-id @a)} (:partial-view @b)))
+        ;; Keep a reachable bootstrap view, then lose the first renewal request.
+        (reset! (:drop? net) #(= "renew" (first (clojure.string/split (:text %) #"--" 2))))
+        (lease-tick (get-id @a) a)
+        (is (:renewal-pending? @a))
+        (reset! (:drop? net) (constantly false))
+        (reset! (:sent net) [])
+        (lease-tick (get-id @a) a)
+        (network/drain net)
+        (is (false? (:renewal-pending? @a)))
+        (is (> (:epoch (:subscription @a)) (:epoch old-subscription)))
+        ;; A renewal uses each contact edge once, with no c extra copies.
+        (is (= 1 (count (filter #(and (= (get-id @c) (:sender %))
+                                      (.startsWith (:text %) "subscription--")) @(:sent net)))))
+        (is (some #{(get-id @a)} (:partial-view @b)))
+        ;; An expired packet cannot resurrect the previous generation.
+        (handle-message (get-id @b) b
+          (udp/packet (udp/get-bytes-utf8
+                        (str "subscription--" (gossip.wire/encode-subscription old-subscription)))
+                      (udp/make-address "127.0.0.1") 1603))
+        (is (= (:subscription @a) (get-in @b [:leases (get-id @a)])))
+        (let [view (:partial-view @a)]
+          (lease-tick (get-id @a) a)
+          (is (= view (:partial-view @a)))))
+      (swap! clock + 1000)
+      (expire-subscriptions! b)
+      (is (not-any? #{(get-id @a)} (:partial-view @b))))))
+
+(deftest lease-option-validation
+  (doseq [duration [0 -1 1.5 86400001]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (create-node "127.0.0.1" 1601 :lease-duration-ms duration)))))
