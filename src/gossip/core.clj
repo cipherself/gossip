@@ -13,12 +13,16 @@
                      partial-view
                      heartbeat-counter
                      forward-counters
-                     received-messages]
+                     received-messages
+                     c]
               :or {in-view []
                    partial-view []
                    heartbeat-counter 5
                    forward-counters {}
-                   received-messages #{}}}]
+                   received-messages #{}
+                   c gossip.core/c}}]
+  (when-not (and (integer? c) (<= 0 c 1000))
+    (throw (ex-info "c must be an integer between 0 and 1000" {:c c})))
   (wire/node-id ip port)
   (doseq [id (concat in-view partial-view)] (wire/require-id id))
   {:ip ip
@@ -27,7 +31,8 @@
    :partial-view partial-view
    :heartbeat-counter heartbeat-counter
    :forward-counters forward-counters
-   :received-messages received-messages})
+   :received-messages received-messages
+   :c c})
 
 (defn get-id
   "Get the id of a node map e.g. {:ip \"192.168.1.1\" :port 1024} 
@@ -35,14 +40,19 @@
   [node]
   (wire/node-id (:ip node) (:port node)))
 
+(defn- add-peer [node view peer]
+  (if (or (= peer (get-id node)) (some #{peer} (view node)))
+    node
+    (update-in node [view] conj peer)))
+
+(defn- remove-peer [node view peer]
+  (update-in node [view] #(vec (remove #{peer} %))))
+
 (defn post-send-initial
   "Add contact-id to subscriber's partial-view."
   [subscriber-ref contact-id]
-  (dosync (ref-set subscriber-ref (update-in
-                                   @subscriber-ref
-                                   [:partial-view]
-                                   conj
-                                   contact-id))))
+  (wire/require-id contact-id)
+  (dosync (alter subscriber-ref add-peer :partial-view contact-id)))
 
 (defn send-initial
   "Send an initial subscription message to a contact node."
@@ -66,44 +76,35 @@
         partial-view (:partial-view @receiving-node-ref)]
     (when-not (empty? partial-view)
       (run! f partial-view)
-      (run! f (repeatedly c #(rand-nth partial-view))))
-    (dosync (ref-set receiving-node-ref (update-in
-                                         @receiving-node-ref
-                                         [:in-view]
-                                         conj
-                                         subscriber-id)))))
+      (run! f (repeatedly (get @receiving-node-ref :c c) #(rand-nth partial-view))))
+    (dosync (alter receiving-node-ref add-peer :in-view subscriber-id))))
 
 (defn forward-prob-accept
-  "Accept a ForwardSubscription request with probablity 
-  (p = 1 / 1+ size of partial-view) or forward it to a
-  random node in the partial-view and update the 
-  forward-counters map."
-  [socket forwarded-to-ref subscriber-id]
+  "Keep a subscription or forward it, processing at most ten copies per subscriber."
+  [socket node-ref subscriber-id]
+  (wire/require-id subscriber-id)
   (let [sample (rand)
-        target (dosync
-                 (let [partial-view (:partial-view @forwarded-to-ref)]
-                   (if (<= sample (/ 1 (inc (count partial-view))))
-                     (do
-                       (alter forwarded-to-ref update-in [:partial-view] conj subscriber-id)
-                       nil)
-                     (do
-                       (alter forwarded-to-ref update-in
-                              [:forward-counters (keyword subscriber-id)]
-                              (fn [counter] (if (nil? counter) 0 (inc counter))))
-                       (when-not (empty? partial-view)
-                         (rand-nth partial-view))))))]
-    ;; Send only after the transaction commits, so retries cannot resend it.
-    (when target
-      (forward socket subscriber-id target))))
+        action (dosync
+                 (let [node @node-ref
+                       view (:partial-view node)
+                       counter (get-in node [:forward-counters (keyword subscriber-id)] -1)]
+                   (when (< counter 9)
+                     (alter node-ref assoc-in [:forward-counters (keyword subscriber-id)] (inc counter))
+                     (if (and (not= subscriber-id (get-id node))
+                              (not (some #{subscriber-id} view))
+                              (<= sample (/ 1 (inc (count view)))))
+                       (do (alter node-ref add-peer :partial-view subscriber-id)
+                           [:kept subscriber-id])
+                       (when (seq view) [:forward (rand-nth view)])))))]
+    (case (first action)
+      :kept (wire/send! socket subscriber-id "kept")
+      :forward (forward socket subscriber-id (second action))
+      nil)))
 
 (defn handle-receive-forward
-  "Handle a ForwardSubscription request, if the request has been received more than
-  10 times, simply discard the thread."
-  [socket forwarded-to-ref subscriber-id]
-  (if (contains? (:forward-counters @forwarded-to-ref) (keyword subscriber-id))
-    (when (< (inc ((keyword subscriber-id) (:forward-counters @forwarded-to-ref))) 10)
-      (forward-prob-accept socket forwarded-to-ref subscriber-id))
-    (forward-prob-accept socket forwarded-to-ref subscriber-id)))
+  "Handle a forwarded subscription, including duplicate and self subscriptions."
+  [socket node-ref subscriber-id]
+  (forward-prob-accept socket node-ref subscriber-id))
 
 (defn send-heartbeat
   [socket node-id]
@@ -117,21 +118,21 @@
    #(run! (partial send-heartbeat socket) (:partial-view @sender-ref))
    my-pool))
 
+(defn heartbeat-tick
+  "Decrease the isolation counter and retry subscription when it expires."
+  [socket node-ref]
+  (let [contact (dosync
+                  (let [node @node-ref
+                        counter (dec (:heartbeat-counter node))]
+                    (alter node-ref assoc :heartbeat-counter (if (pos? counter) counter 10))
+                    (when (and (not (pos? counter)) (seq (:partial-view node)))
+                      (rand-nth (:partial-view node)))))]
+    (when contact (send-initial socket node-ref contact))))
+
 (defn schedule-heartbeat-dec
-  "Decrease the value of the heartbeat-counter after every \"interval\",
-  if the counter reaches zero, send an InitialSubscription request to
-  a random node from the partial-view."
+  "Periodically detect isolation and retry subscription through a known peer."
   [socket node-ref interval]
-  (every
-   interval
-   #(dosync (if (<= (dec (:heartbeat-counter @node-ref)) 0)
-              (when-not (empty? (:partial-view @node-ref))
-                (send-initial socket node-ref (rand-nth (:partial-view @node-ref))))
-              (ref-set node-ref (update-in
-                                 @node-ref
-                                 [:heartbeat-counter]
-                                 dec))))
-   my-pool))
+  (every interval #(heartbeat-tick socket node-ref) my-pool))
 
 (defn handle-receive-heartbeat
   "Update the heartbeat-counter."
@@ -148,12 +149,7 @@
 (defn handle-receive-remove
   ""
   [receiving-node-ref to-remove-id]
-  (dosync (ref-set receiving-node-ref (assoc
-                                       @receiving-node-ref
-                                       :partial-view
-                                       (vec (remove
-                                             #{to-remove-id}
-                                             (:partial-view @receiving-node-ref)))))))
+  (dosync (alter receiving-node-ref remove-peer :partial-view to-remove-id)))
 
 (defn send-replace
   [socket node-id surrogate-id]
@@ -161,35 +157,35 @@
   (wire/send! socket node-id (str "replace--" surrogate-id)))
 
 (defn handle-receive-replace
-  ""
-  [receiving-node-ref original-id surrogate-id]
-  (dosync (ref-set
-           receiving-node-ref
-           (assoc
-            @receiving-node-ref
-            :partial-view
-            (-> (remove #{original-id} (:partial-view @receiving-node-ref))
-                (conj surrogate-id)
-                vec)))))
+  "Replace an existing edge once, rejecting duplicate and self edges."
+  ([node-ref original-id surrogate-id]
+   (wire/require-id surrogate-id)
+   (dosync
+     (when (some #{original-id} (:partial-view @node-ref))
+       (alter node-ref remove-peer :partial-view original-id)
+       (let [before (:partial-view @node-ref)]
+         (alter node-ref add-peer :partial-view surrogate-id)
+         (not= before (:partial-view @node-ref))))))
+  ([socket node-ref original-id surrogate-id]
+   (when (handle-receive-replace node-ref original-id surrogate-id)
+     (wire/send! socket surrogate-id "kept"))))
 
 (defn unsubscribe
-  ""
-  [socket unsubscriber-ref]
-  (let [in-view (:in-view @unsubscriber-ref)
-        partial-view (:partial-view @unsubscriber-ref)
-        in-view-count (count in-view)
-        partial-view-count (count partial-view)]
-    (when-not (and (empty? in-view) (empty? partial-view))
-      (doseq [x (range 0 (if (< in-view-count 15)
-                           in-view-count
-                           (- in-view-count c 1)))]
-        (send-replace
-         socket
-         (in-view x)
-         (partial-view (mod x partial-view-count))))
-      (when-not (< in-view-count 15)
-        (doseq [y (subvec in-view (- in-view-count c))]
-          (send-remove socket y))))))
+  "Replace incoming edges except for c+1 removals, then detach outgoing edges."
+  [socket node-ref]
+  (let [node @node-ref
+        incoming (vec (distinct (:in-view node)))
+        outgoing (vec (distinct (:partial-view node)))
+        replacements (if (seq outgoing)
+                       (max 0 (- (count incoming) (inc (get node :c c))))
+                       0)]
+    (doseq [[index peer] (map-indexed vector incoming)]
+      (if (< index replacements)
+        (send-replace socket peer (outgoing (mod index (count outgoing))))
+        (send-remove socket peer)))
+    (doseq [peer outgoing]
+      (wire/send! socket peer "forget"))
+    (dosync (alter node-ref assoc :partial-view [] :in-view [] :forward-counters {}))))
 
 (defn gossip
   "Send a message to all nodes in the partial-view."
@@ -221,12 +217,16 @@
                     (handle-receive-initial socket receiving-node-ref sender))
         "forward" (when (wire/parse-id payload)
                     (handle-receive-forward socket receiving-node-ref payload))
+        "kept" (when (= 1 (count fields))
+                 (dosync (alter receiving-node-ref add-peer :in-view sender)))
+        "forget" (when (= 1 (count fields))
+                   (dosync (alter receiving-node-ref remove-peer :in-view sender)))
         "heartbeat" (when (= 1 (count fields))
                       (handle-receive-heartbeat receiving-node-ref))
         "remove" (when (= 1 (count fields))
                    (handle-receive-remove receiving-node-ref sender))
         "replace" (when (wire/parse-id payload)
-                    (handle-receive-replace receiving-node-ref sender payload))
+                    (handle-receive-replace socket receiving-node-ref sender payload))
         "gossip" (when (some? payload)
                    (handle-receive-gossip socket receiving-node-ref payload))
         nil))))

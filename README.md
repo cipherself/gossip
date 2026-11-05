@@ -80,7 +80,8 @@ discretion.**
 ## TODO
 
 * Tests use `clojure.test`.
-* Seriously! MOAR TESTS!
+* Membership regression tests cover joins, departures, duplicate subscriptions,
+  isolation recovery, and dropped subscription requests.
 * IDs and protocol messages are validated. Malformed datagrams are ignored.
   Payloads preserve UTF-8 text and `--` separators, up to the UDP limit of
   65507 bytes including the protocol prefix. The receive buffer must fit the
@@ -89,7 +90,9 @@ discretion.**
 * DTLS.
 * Implement indirection.
 * Implement lease functionality.
-* Decouple the design parameter?
+* Configure the subscription redundancy with `:c` in `create-node` (default 10).
+  Use the same value throughout a group. It controls extra subscription copies
+  and the `c + 1` incoming edges removed during departure.
 
 ## License
 [MIT](./LICENSE)
