@@ -82,7 +82,7 @@ discretion.**
 ## Configuration and testing
 
 Tests use `clojure.test` and `test.check` for generated regression cases.
-Run `lein test` to execute the unit, simulated-network,
+Run `clojure -M:test` to execute the unit, simulated-network,
 and loopback UDP integration tests. The simulations cover joins, departures,
 duplicate subscriptions, isolation recovery, dropped requests, leases, and
 indirection.
@@ -97,6 +97,13 @@ Configure subscription redundancy with `:c` in `create-node` (default 10,
 range 0..1000). Use the same value throughout a group. It controls extra
 subscription copies and the `c + 1` incoming edges removed during departure.
 Stop scheduled maintenance before calling `unsubscribe` and closing the socket.
+
+## Building
+
+Build the library JAR and POM with `clojure -T:build jar`.
+The artifact version is defined in `build.clj`.
+To publish to Clojars, set `CLOJARS_USERNAME` and `CLOJARS_PASSWORD`, then run
+`clojure -T:build deploy`.
 
 ## TODO
 
@@ -152,14 +159,14 @@ this protocol version on all participating nodes.
 
 ## Simulation
 
-Run `lein simulate` to compare random contacts, a shared bootstrap, and weighted
+Run `clojure -M:simulate` to compare random contacts, a shared bootstrap, and weighted
 indirection with a lossless packet queue. Supply options as one EDN map.
 
 ```sh
-lein simulate '{:sizes [100 500] :seeds [1 2 3] :modes [:indirect] :seed-size 1}'
-lein simulate '{:sizes [100] :modes [:indirect] :weight-rounds 20}'
-lein simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true}'
-lein simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true :recovery-rounds 60}'
+clojure -M:simulate '{:sizes [100 500] :seeds [1 2 3] :modes [:indirect] :seed-size 1}'
+clojure -M:simulate '{:sizes [100] :modes [:indirect] :weight-rounds 20}'
+clojure -M:simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true}'
+clojure -M:simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true :recovery-rounds 60}'
 ```
 
 `:seed-size` selects an empty bootstrap (1) or a directed ring.
