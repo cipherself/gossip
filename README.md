@@ -17,6 +17,22 @@ and remains subject to its own copyright.
 are not encrypted, they are sent as plaintext, use at your own
 discretion.**
 
+## Installation
+
+Clojure CLI
+
+```clojure
+gossip/gossip {:mvn/version "0.2.0"}
+```
+
+Leiningen
+
+```clojure
+[gossip "0.2.0"]
+```
+
+See the [release notes](./CHANGELOG.md) for upgrade requirements.
+
 ## Usage
 
 ```clojure

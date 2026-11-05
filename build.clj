@@ -3,7 +3,7 @@
             [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'gossip/gossip)
-(def version "0.1.0")
+(def version "0.2.0")
 (def class-dir "target/classes")
 (def jar-file (str "target/gossip-" version ".jar"))
 (def pom-file (str class-dir "/META-INF/maven/gossip/gossip/pom.xml"))
@@ -26,7 +26,8 @@
                   [:url "https://opensource.org/licenses/MIT"]]]
                 [:scm
                  [:url "https://github.com/cipherself/gossip"]
-                 [:connection "scm:git:https://github.com/cipherself/gossip.git"]]]})
+                 [:connection "scm:git:https://github.com/cipherself/gossip.git"]
+                 [:tag version]]]})
   (b/copy-dir {:src-dirs ["src"] :target-dir class-dir})
   (b/copy-file {:src "LICENSE" :target (str class-dir "/LICENSE")})
   (b/jar {:class-dir class-dir :jar-file jar-file})
