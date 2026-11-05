@@ -103,6 +103,10 @@
   [node-ref]
   (let [now (now-ms)]
     (dosync
+      (when-let [own (:subscription @node-ref)]
+        (doseq [[peer lease] (:incoming-leases @node-ref)
+                :when (not= (:id lease) (get-id @node-ref))]
+          (alter node-ref assoc-in [:incoming-leases peer] own)))
       (doseq [[id lease] (:leases @node-ref)
               :when (<= (:expires-at lease) now)]
         (alter node-ref remove-peer :partial-view id)
@@ -112,10 +116,28 @@
         (alter node-ref remove-peer :in-view id)
         (alter node-ref update-in [:incoming-leases] dissoc id)))))
 
-(defn- notify-kept [socket node-ref subscriber-id]
-  (if-let [subscription (own-subscription! node-ref)]
-    (wire/send! socket subscriber-id (str "kept-lease--" (wire/encode-subscription subscription)))
+(defn- notify-kept
+  "Acknowledge an edge using the destination's subscription generation."
+  [socket node-ref subscriber-id]
+  (if-let [subscription (get-in @node-ref [:leases subscriber-id])]
+    (wire/send! socket subscriber-id
+                (str "edge-lease--" (wire/encode-subscription subscription)))
     (wire/send! socket subscriber-id "kept")))
+
+(defn- record-incoming! [node-ref peer subscription]
+  (dosync
+    (alter node-ref add-peer :in-view peer)
+    (when subscription
+      (alter node-ref assoc-in [:incoming-leases peer] subscription))))
+
+(defn- receive-lease-info [socket node-ref sender subscription]
+  (when (and (= sender (:id subscription))
+             (remember-subscription! node-ref subscription))
+    (let [has-edge? (dosync
+                      (when (some #{sender} (:partial-view @node-ref))
+                        (alter node-ref assoc-in [:leases sender] subscription)
+                        true))]
+      (when has-edge? (notify-kept socket node-ref sender)))))
 
 (defn send-initial
   "Send an initial subscription message to a contact node."
@@ -211,9 +233,11 @@
         (doseq [peer (concat view (repeatedly extra #(rand-nth view)))]
           (send-subscription socket peer subscription)))
       (when-not renewal?
-        (dosync
-          (alter node-ref add-peer :in-view (:id subscription))
-          (alter node-ref assoc-in [:incoming-leases (:id subscription)] subscription)))
+        (let [contact-subscription (own-subscription! node-ref)]
+          (record-incoming! node-ref (:id subscription) contact-subscription)
+          (when contact-subscription
+            (wire/send! socket (:id subscription)
+                        (str "lease-info--" (wire/encode-subscription contact-subscription))))))
       (wire/send! socket (:id subscription)
                   (str "renewed--" (wire/encode-subscription subscription))))))
 
@@ -259,11 +283,11 @@
                     (str "walk--" (wire/encode-walk (update-in walk [:hops] #(max 0 (dec %))))))
         ;; A node cannot serve as its own subscription contact.
         (when (not= (:id walk) (get-id node))
+          (when-not (:renewal? walk)
+            (wire/send! socket (:id walk) (str "contact--" (:contact walk))))
           (if-let [subscription (:subscription walk)]
             (handle-join socket node-ref subscription (:renewal? walk))
-            (handle-receive-initial socket node-ref (:id walk)))
-          (when-not (:renewal? walk)
-            (wire/send! socket (:id walk) (str "contact--" (:contact walk)))))))))
+            (handle-receive-initial socket node-ref (:id walk))))))))
 
 (defn- route-join [socket node-ref subscriber-id subscription renewal?]
   (if (:indirection? @node-ref)
@@ -453,13 +477,24 @@
                         (alter receiving-node-ref assoc :renewal-pending? false))))
         "subscription" (when-let [subscription (wire/decode-subscription payload)]
                          (handle-subscription socket receiving-node-ref subscription))
+        "lease-info" (when-let [subscription (wire/decode-subscription payload)]
+                       (receive-lease-info socket receiving-node-ref sender subscription))
+        "edge-lease" (when-let [subscription (wire/decode-subscription payload)]
+                       (expire-subscriptions! receiving-node-ref)
+                       (when (and (= subscription (:subscription @receiving-node-ref))
+                                  (< (now-ms) (:expires-at subscription)))
+                         (record-incoming! receiving-node-ref sender subscription)))
+        ;; Accept notifications from the earlier lease protocol, then correct
+        ;; the sender's edge deadline with this destination's own subscription.
         "kept-lease" (when-let [subscription (wire/decode-subscription payload)]
                        (when (and (= sender (:id subscription))
                                   (remember-subscription! receiving-node-ref subscription))
                          (expire-subscriptions! receiving-node-ref)
-                         (dosync
-                           (alter receiving-node-ref add-peer :in-view sender)
-                           (alter receiving-node-ref assoc-in [:incoming-leases sender] subscription))))
+                         (let [own (own-subscription! receiving-node-ref)]
+                           (record-incoming! receiving-node-ref sender own)
+                           (when own
+                             (wire/send! socket sender
+                                         (str "lease-info--" (wire/encode-subscription own)))))))
         "initial" (when (= 1 (count fields))
                     (route-join socket receiving-node-ref sender nil false))
         "forward" (when (wire/parse-id payload)

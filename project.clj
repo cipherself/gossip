@@ -6,7 +6,8 @@
   :dependencies [[org.clojure/clojure "1.12.6"]
                  [udp-wrapper "0.1.3"]
                  [overtone/at-at "1.2.0"]]
-  :profiles {:dev {:dependencies [[org.clojure/tools.nrepl "0.2.12"]]
+  :profiles {:dev {:dependencies [[org.clojure/tools.nrepl "0.2.12"]
+                                   [org.clojure/test.check "1.1.3"]]
                    :plugins [[jonase/eastwood "0.2.1"]
                              [lein-kibit "0.1.2"]
                              [lein-bikeshed "0.2.0"]]}}

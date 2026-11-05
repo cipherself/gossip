@@ -81,7 +81,8 @@ discretion.**
 
 ## Configuration and testing
 
-Tests use `clojure.test`. Run `lein test` to execute the unit, simulated-network,
+Tests use `clojure.test` and `test.check` for generated regression cases.
+Run `lein test` to execute the unit, simulated-network,
 and loopback UDP integration tests. The simulations cover joins, departures,
 duplicate subscriptions, isolation recovery, dropped requests, leases, and
 indirection.
@@ -107,6 +108,9 @@ Set `:lease-duration-ms` on every node in a group to enable leases, for example
 `(create-node ip port :c 1 :lease-duration-ms 60000)`. The default is disabled.
 Lease-enabled nodes exchange subscription generations and absolute expiry times.
 Peers need synchronized clocks. Durations must be 1..86400000 milliseconds.
+For an edge A → B, both A's outgoing record and B's incoming record use B's
+subscription generation and deadline. The contact returns its lease information
+to the subscriber, and accepted edges acknowledge that destination lease.
 
 Run `(schedule-lease-maintenance socket node 1000)` for each node. Keep its
 returned job handle and stop it with `overtone.at-at/stop` during shutdown.
