@@ -2,8 +2,7 @@
   (:require [clojure.string :refer [split]]
             [udp-wrapper.core :refer [send-message packet make-address get-ip
                                       get-port get-data get-bytes-utf8]]
-            [overtone.at-at :refer [mk-pool every]])
-  (:import (java.util Random)))
+            [overtone.at-at :refer [mk-pool every]]))
 
 (def my-pool (mk-pool))
 (def c 10)
@@ -85,30 +84,22 @@
   random node in the partial-view and update the 
   forward-counters map."
   [socket forwarded-to-ref subscriber-id]
-  (let [node forwarded-to-ref]
-    (dosync (if (<= (.nextDouble (Random.)) (/ 1 (inc (count (:partial-view @node)))))
-              (ref-set node (update-in
-                             @node
-                             [:partial-view]
-                             conj
-                             subscriber-id))
-              (do
-                (when-not empty? (:partial-view @node)
-                          (forward
-                           socket
-                           subscriber-id
-                           (rand-nth (:partial-view @node))))
-                (if (contains? (:forward-counters @node) (keyword subscriber-id))
-                  (ref-set node (update-in
-                                 @node
-                                 [:forward-counters (keyword subscriber-id)]
-                                 inc))
-                  (ref-set node (update-in
-                                 @node
-                                 [:forward-counters]
-                                 assoc
-                                 (keyword subscriber-id)
-                                 0))))))))
+  (let [sample (rand)
+        target (dosync
+                 (let [partial-view (:partial-view @forwarded-to-ref)]
+                   (if (<= sample (/ 1 (inc (count partial-view))))
+                     (do
+                       (alter forwarded-to-ref update-in [:partial-view] conj subscriber-id)
+                       nil)
+                     (do
+                       (alter forwarded-to-ref update-in
+                              [:forward-counters (keyword subscriber-id)]
+                              (fn [counter] (if (nil? counter) 0 (inc counter))))
+                       (when-not (empty? partial-view)
+                         (rand-nth partial-view))))))]
+    ;; Send only after the transaction commits, so retries cannot resend it.
+    (when target
+      (forward socket subscriber-id target))))
 
 (defn handle-receive-forward
   "Handle a ForwardSubscription request, if the request has been received more than
@@ -233,12 +224,12 @@
   If it's the first time that the node has received the message,
   add the message to `received-messages' and gossip it."
   [socket receiving-node-ref message]
-  (dosync (ref-set receiving-node-ref (update-in
-                                       @receiving-node-ref
-                                       [:received-messages]
-                                       conj
-                                       message)))
-  (gossip socket receiving-node-ref message))
+  (let [first-receipt? (dosync
+                         (when-not (contains? (:received-messages @receiving-node-ref) message)
+                           (alter receiving-node-ref update-in [:received-messages] conj message)
+                           true))]
+    (when first-receipt?
+      (gossip socket receiving-node-ref message))))
 
 (defn handle-message
   "Handle received messages."
