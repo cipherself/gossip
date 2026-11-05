@@ -159,6 +159,7 @@ indirection with a lossless packet queue. Supply options as one EDN map.
 lein simulate '{:sizes [100 500] :seeds [1 2 3] :modes [:indirect] :seed-size 1}'
 lein simulate '{:sizes [100] :modes [:indirect] :weight-rounds 20}'
 lein simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true}'
+lein simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true :recovery-rounds 60}'
 ```
 
 `:seed-size` selects an empty bootstrap (1) or a directed ring.
@@ -166,6 +167,15 @@ lein simulate '{:sizes [100 500] :modes [:random :indirect] :leases? true}'
 `:settle-rounds` controls additional refresh sweeps after growth.
 Output includes view sizes, connectivity, reciprocal edge metadata, and weighted
 walk diagnostics. Walks that reach an empty view count as routing failures.
+
+`:recovery-rounds` enables continued lease maintenance and heartbeat recovery
+after the initial renewal phase (default 0). Each round advances the simulated
+clock by `:recovery-step-ms` (default 100), runs lease maintenance, sends
+heartbeats, and checks isolation counters. Weight updates run each round when
+indirection is enabled. The recovery output includes a connectivity trace,
+the first connected round, and the number of nodes reached by a final gossip
+message. First recovery and connectivity at the end of the run are reported
+separately because lease expiry can create further transient partitions.
 
 ## License
 [MIT](./LICENSE)

@@ -77,10 +77,42 @@
                         (count seen))))]
     (= (count nodes) (reachable outgoing) (reachable incoming))))
 
+(defn- recover
+  [nodes clock drain refresh rounds step-ms indirection?]
+  (let [connected-at-start? (strongly-connected? nodes)
+        trace (mapv (fn [_]
+                      (swap! clock + step-ms)
+                      (doseq [node nodes] (gossip/lease-tick (gossip/get-id @node) node))
+                      (drain)
+                      (doseq [node nodes peer (:partial-view @node)]
+                        (gossip/send-heartbeat (gossip/get-id @node) peer))
+                      (drain)
+                      (doseq [node nodes] (gossip/heartbeat-tick (gossip/get-id @node) node))
+                      (drain)
+                      (when indirection? (refresh nodes 1))
+                      (strongly-connected? nodes))
+                    (range rounds))
+        origin (first nodes)
+        message "simulation-recovery-check"]
+    (gossip/gossip (gossip/get-id @origin) origin message)
+    (drain)
+    {:rounds rounds
+     :step-ms step-ms
+     :connected-at-round (if connected-at-start? 0
+                           (first (keep-indexed #(when %2 (inc %1)) trace)))
+     :connected-trace trace
+     :after (assoc (view-stats nodes) :strongly-connected? (strongly-connected? nodes))
+     :gossip-reached (count (filter #(or (= % origin)
+                                         (contains? (:received-messages @%) message)) nodes))}))
+
 (defn run-scenario
-  [{:keys [size seed mode leases? seed-size weight-rounds settle-rounds]
+  [{:keys [size seed mode leases? seed-size weight-rounds settle-rounds
+           recovery-rounds recovery-step-ms]
     :or {size 100 seed 1 mode :indirect leases? false seed-size 5
-         weight-rounds 1 settle-rounds 20}}]
+         weight-rounds 1 settle-rounds 20 recovery-rounds 0 recovery-step-ms 100}}]
+  (when-not (and (integer? recovery-rounds) (<= 0 recovery-rounds 10000)
+                 (integer? recovery-step-ms) (pos? recovery-step-ms))
+    (throw (ex-info "Recovery requires 0..10000 rounds and a positive millisecond step" {})))
   (let [clock (atom 100000)
         durations (java.util.Random. (+ seed 1000000))
         nodes (mapv #(ref (gossip/create-node "127.0.0.1" (+ 10000 %) :c 0
@@ -134,14 +166,18 @@
                 (doseq [peer nodes] (gossip/expire-subscriptions! peer))
                 (gossip/lease-tick (gossip/get-id @node) node)
                 (drain)))
-            (when (= mode :indirect) (refresh nodes settle-rounds))
-            {:size size :seed seed :mode mode :leases? leases? :seed-size seed-size
-             :weight-rounds weight-rounds :settle-rounds settle-rounds
-             :before before :after (when leases? (assoc (view-stats nodes)
-                                                       :strongly-connected? (strongly-connected? nodes)))
-             :edge-mismatches (edge-mismatches nodes (:nodes net))
-             :routing-before routing-before
-             :routing-after (when (= mode :indirect) (routing-stats nodes (nodes 0)))}))))))
+            (let [after-renewal (when leases? (assoc (view-stats nodes)
+                                                        :strongly-connected? (strongly-connected? nodes)))
+                  recovery (when (pos? recovery-rounds)
+                             (recover nodes clock drain refresh recovery-rounds recovery-step-ms
+                                      (= mode :indirect)))]
+              (when (= mode :indirect) (refresh nodes settle-rounds))
+              {:size size :seed seed :mode mode :leases? leases? :seed-size seed-size
+               :weight-rounds weight-rounds :settle-rounds settle-rounds
+               :before before :after after-renewal :recovery recovery
+               :edge-mismatches (edge-mismatches nodes (:nodes net))
+               :routing-before routing-before
+               :routing-after (when (= mode :indirect) (routing-stats nodes (nodes 0)))})))))))
 
 (defn -main [& [options]]
   (let [{:keys [sizes seeds modes] :or {sizes [100 500] seeds [1 2 3]
